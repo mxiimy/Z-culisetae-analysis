@@ -7,17 +7,49 @@ set.seed(123) # Ensures reproducible random imputation
 # Load data
 raw_data <- read.csv("proteins.csv", stringsAsFactors = FALSE)
 
-# Strip column names so that they are "C3", "D1", et
+# Strip column names so that they are "C3", "D1", etc.
 names(raw_data) <- gsub("LFQ.intensity.", "", names(raw_data))
 
 id_col <- grep("Majority.protein.IDs", names(raw_data), value = TRUE)
 gene_col <- grep("Fasta.headers", names(raw_data), value = TRUE)
 
-# Rename column
+# Rename columns
 raw_data <- raw_data %>% rename(ProteinID = all_of(id_col), FastaHeader = all_of(gene_col))
 
-# Remove E11 as outlier
-raw_data <- raw_data %>% select(-matches("E11"))
+# Remove E11 and L6 
+raw_data <- raw_data %>%
+  select(-matches("E11")) %>%
+  select(-matches("L6"))
+
+# Identify current data columns
+initial_data_cols <- names(raw_data)[!names(raw_data) %in% c("ProteinID", "FastaHeader", gene_col, id_col)]
+
+# Calculate the median intensity for each sample
+sample_medians <- raw_data %>%
+  select(all_of(initial_data_cols)) %>%
+  # Calculate median for each column (sample)
+  summarise(across(everything(), ~ median(., na.rm = TRUE))) %>%
+  pivot_longer(everything(), names_to = "Sample", values_to = "MedianIntensity")
+
+# Determine which samples to keep (Top 3 per Group, based on median intensity)
+samples_to_keep <- sample_medians %>%
+  mutate(Group = substr(Sample, 1, 1)) %>%
+  group_by(Group) %>%
+  # Arrange by median intensity descending and take the top 3
+  arrange(desc(MedianIntensity)) %>%
+  slice_head(n = 3) %>%
+  pull(Sample)
+
+# Filter the raw_data to keep only the selected samples plus ID columns
+id_cols_all <- c("ProteinID", "FastaHeader") # Gene column is created later
+raw_data <- raw_data %>% select(all_of(id_cols_all), all_of(samples_to_keep))
+
+# Update the data_cols variable for subsequent steps
+data_cols <- samples_to_keep
+unique_groups <- unique(substr(data_cols, 1, 1))
+
+print(paste("Selected samples (Top 3 per group):", paste(data_cols, collapse = ", ")))
+print(paste("Groups analyzed:", paste(unique_groups, collapse = ", ")))
 
 # -----------------------------------------------------------------------------
 # Preprocessing!
@@ -29,13 +61,7 @@ raw_data$Gene <- gsub("GN=", "", raw_data$Gene)
 # If no gene name found, default back to ProteinID
 raw_data$Gene[is.na(raw_data$Gene)] <- raw_data$ProteinID[is.na(raw_data$Gene)]
 
-# Identify data columns (excluding ID/Gene columns)
-data_cols <- names(raw_data)[!names(raw_data) %in% c("ProteinID", "FastaHeader", "Gene")]
-
-# Define unique groups (C, D, L, E)
-unique_groups <- unique(substr(data_cols, 1, 1))
-
-# Use 'apply' to check each row. It preserves column names reliably.
+# Use 'apply' to check each row for quantification completeness
 keep_rows <- apply(raw_data[, data_cols], 1, function(row_vals) {
   # Check each group separately
   valid_counts <- sapply(unique_groups, function(g) {
@@ -44,7 +70,8 @@ keep_rows <- apply(raw_data[, data_cols], 1, function(row_vals) {
     # Count how many numbers are NOT NA
     sum(!is.na(row_vals[group_cols]))
   })
-  # Keep row if any group has at least 3 valid values
+  # Keep row if any group has at least 3 valid values (since we only have 3 per group now)
+  # This means the protein must be quantified in all 3 samples of at least one group
   any(valid_counts >= 3)
 })
 
@@ -91,11 +118,11 @@ pca_df$Group <- substr(rownames(pca_df), 1, 1)
 pca_df$Sample <- rownames(pca_df)
 
 # Plot
-ggplot(pca_df, aes(x = PC1, y = PC2, color = Group, label = Sample)) +
-  geom_point(size = 4) +
-  geom_text_repel() +
-  theme_minimal() +
-  labs(title = "PCA Plot no E11")
+print(ggplot(pca_df, aes(x = PC1, y = PC2, color = Group, label = Sample)) +
+        geom_point(size = 4) +
+        geom_text_repel() +
+        theme_minimal() +
+        labs(title = "PCA Plot (Top 3 Samples Selected)"))
 
 # ----------------------------------------------------------------------------
 # ANOVA
@@ -107,20 +134,27 @@ long_data <- data_imputed %>%
 # Run ANOVA
 anova_results <- long_data %>%
   group_by(ProteinID, Gene) %>%
-  summarise(p_val = summary(aov(Intensity ~ Group))[[1]][["Pr(>F)"]][1], .groups = "drop")
+  # Ensure there is variation within groups for ANOVA to run
+  summarise(p_val = tryCatch({
+    summary(aov(Intensity ~ Group, data = cur_data()))[[1]][["Pr(>F)"]][1]
+  }, error = function(e) {
+    # Return 1 if ANOVA fails (e.g., if no variation within a group)
+    return(1)
+  }), .groups = "drop")
 
 # Adjust P-values
 anova_results$p_adj <- p.adjust(anova_results$p_val, method = "BH")
 sig_proteins <- anova_results %>% filter(p_adj < 0.05)
 
-print(paste("Significant proteins found:", nrow(sig_proteins)))
+print(paste("Significant proteins found (p.adj < 0.05):", nrow(sig_proteins)))
 
-# Calculate Fold Changes for Volcano Plot
+# Calculate Fold Changes for Volcano Plot (L vs C)
 fold_changes <- data_imputed %>%
   rowwise() %>%
   mutate(
-    Mean_C = mean(c_across(starts_with("C"))),
-    Mean_L = mean(c_across(starts_with("L"))),
+    # Use selected data columns for mean calculation
+    Mean_C = mean(c_across(all_of(data_cols[substr(data_cols, 1, 1) == "C"]))),
+    Mean_L = mean(c_across(all_of(data_cols[substr(data_cols, 1, 1) == "L"]))),
     Log2FC_L_vs_C = Mean_L - Mean_C
   ) %>%
   ungroup() %>%
@@ -140,25 +174,37 @@ if(nrow(sig_proteins) > 0) {
   # Add Gene names as row labels
   rownames(sig_matrix) <- data_imputed$Gene[data_imputed$ProteinID %in% sig_proteins$ProteinID]
   
-  pheatmap(sig_matrix, scale = "row", 
-           show_rownames = TRUE, fontsize_row = 6,
-           main = "Heatmap of ANOVA Significant Proteins")
+  # Scale by row (Z-score) for visualization
+  print(pheatmap(sig_matrix, scale = "row", 
+                 show_rownames = TRUE, 
+                 fontsize_row = 4,
+                 fontsize_col = 8,
+                 main = "Heatmap of ANOVA Significant Proteins"))
+} else {
+  print("No proteins were significant (p.adj < 0.05), skipping heatmap generation.")
 }
 
 # ----------------------------------------------------------------------------
 # Volcano Plot (Light vs Control)
 final_results <- final_results %>%
-  mutate(IsSig = if_else(p_adj < 0.05 & abs(Log2FC_L_vs_C) > 1, "Significant", "Not Sig"))
+  mutate(IsSig = case_when(
+    p_adj < 0.05 & abs(Log2FC_L_vs_C) > 1 ~ "Significant",
+    p_adj < 0.05 & abs(Log2FC_L_vs_C) <= 1 ~ "p < 0.05",
+    TRUE ~ "Not Sig"
+  ))
 
-ggplot(final_results, aes(x = Log2FC_L_vs_C, y = -log10(p_adj), color = IsSig)) +
-  geom_point(alpha = 0.6) +
-  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
-  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
-  scale_color_manual(values = c("grey", "red")) +
-  geom_text_repel(data = subset(final_results, IsSig == "Significant"), 
-                  aes(label = Gene), max.overlaps = 10) +
-  theme_minimal() +
-  labs(title = "Volcano Plot: Light vs Control", x = "Log2 Fold Change (L - C)", y = "-Log10 FDR")
+print(ggplot(final_results, aes(x = Log2FC_L_vs_C, y = -log10(p_adj), color = IsSig)) +
+        geom_point(alpha = 0.6) +
+        geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+        geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+        scale_color_manual(values = c("p < 0.05" = "blue", "Significant" = "red", "Not Sig" = "grey")) +
+        geom_text_repel(data = subset(final_results, IsSig == "Significant"), 
+                        aes(label = Gene), max.overlaps = 15, size = 3) +
+        theme_minimal() +
+        labs(title = "Volcano Plot: Light vs Control (Top 3 Samples)", 
+             x = "Log2 Fold Change (L - C)", 
+             y = "-Log10 FDR",
+             color = "Significance"))
 
 # ---------------------------------------------------------------------
 write.csv(final_results, "results.csv", row.names = FALSE)
