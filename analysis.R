@@ -70,8 +70,7 @@ keep_rows <- apply(raw_data[, data_cols], 1, function(row_vals) {
     # Count how many numbers are NOT NA
     sum(!is.na(row_vals[group_cols]))
   })
-  # Keep row if any group has at least 3 valid values (since we only have 3 per group now)
-  # This means the protein must be quantified in all 3 samples of at least one group
+  # CRITICAL FILTERING STEP: Keep row if any group has at least 3 valid values
   any(valid_counts >= 3)
 })
 
@@ -125,7 +124,7 @@ print(ggplot(pca_df, aes(x = PC1, y = PC2, color = Group, label = Sample)) +
         labs(title = "PCA Plot (Top 3 Samples Selected)"))
 
 # ----------------------------------------------------------------------------
-# ANOVA
+# ANOVA (For Heatmap Generation)
 
 long_data <- data_imputed %>%
   pivot_longer(cols = all_of(data_cols), names_to = "Sample", values_to = "Intensity") %>%
@@ -134,11 +133,9 @@ long_data <- data_imputed %>%
 # Run ANOVA
 anova_results <- long_data %>%
   group_by(ProteinID, Gene) %>%
-  # Ensure there is variation within groups for ANOVA to run
   summarise(p_val = tryCatch({
     summary(aov(Intensity ~ Group, data = cur_data()))[[1]][["Pr(>F)"]][1]
   }, error = function(e) {
-    # Return 1 if ANOVA fails (e.g., if no variation within a group)
     return(1)
   }), .groups = "drop")
 
@@ -146,25 +143,10 @@ anova_results <- long_data %>%
 anova_results$p_adj <- p.adjust(anova_results$p_val, method = "BH")
 sig_proteins <- anova_results %>% filter(p_adj < 0.05)
 
-print(paste("Significant proteins found (p.adj < 0.05):", nrow(sig_proteins)))
-
-# Calculate Fold Changes for Volcano Plot (L vs C)
-fold_changes <- data_imputed %>%
-  rowwise() %>%
-  mutate(
-    # Use selected data columns for mean calculation
-    Mean_C = mean(c_across(all_of(data_cols[substr(data_cols, 1, 1) == "C"]))),
-    Mean_L = mean(c_across(all_of(data_cols[substr(data_cols, 1, 1) == "L"]))),
-    Log2FC_L_vs_C = Mean_L - Mean_C
-  ) %>%
-  ungroup() %>%
-  select(ProteinID, Gene, Log2FC_L_vs_C)
-
-# Combine results
-final_results <- left_join(anova_results, fold_changes, by = c("ProteinID", "Gene"))
+print(paste("Proteins with significant overall change (ANOVA p.adj < 0.05):", nrow(sig_proteins)))
 
 # -----------------------------------------------------------------------------
-# Heat Map!
+# Heat Map! (Uses overall significant proteins from ANOVA)
 if(nrow(sig_proteins) > 0) {
   sig_matrix <- data_imputed %>%
     filter(ProteinID %in% sig_proteins$ProteinID) %>%
@@ -177,34 +159,124 @@ if(nrow(sig_proteins) > 0) {
   # Scale by row (Z-score) for visualization
   print(pheatmap(sig_matrix, scale = "row", 
                  show_rownames = TRUE, 
-                 fontsize_row = 4,
-                 fontsize_col = 8,
+                 fontsize = 8,  # Reduced base font size to 8 to shrink the title
+                 fontsize_row = 4, 
+                 fontsize_col = 8, 
+                 treeheight_col = 30, # Reduced column dendrogram height
                  main = "Heatmap of ANOVA Significant Proteins"))
 } else {
   print("No proteins were significant (p.adj < 0.05), skipping heatmap generation.")
 }
 
 # ----------------------------------------------------------------------------
-# Volcano Plot (Light vs Control)
-final_results <- final_results %>%
-  mutate(IsSig = case_when(
-    p_adj < 0.05 & abs(Log2FC_L_vs_C) > 1 ~ "Significant",
-    p_adj < 0.05 & abs(Log2FC_L_vs_C) <= 1 ~ "p < 0.05",
-    TRUE ~ "Not Sig"
-  ))
+# Pairwise T-tests and Volcano Plots (All Combinations)
+# ----------------------------------------------------------------------------
 
-print(ggplot(final_results, aes(x = Log2FC_L_vs_C, y = -log10(p_adj), color = IsSig)) +
-        geom_point(alpha = 0.6) +
-        geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
-        geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
-        scale_color_manual(values = c("p < 0.05" = "blue", "Significant" = "red", "Not Sig" = "grey")) +
-        geom_text_repel(data = subset(final_results, IsSig == "Significant"), 
-                        aes(label = Gene), max.overlaps = 15, size = 3) +
-        theme_minimal() +
-        labs(title = "Volcano Plot: Light vs Control (Top 3 Samples)", 
-             x = "Log2 Fold Change (L - C)", 
-             y = "-Log10 FDR",
-             color = "Significance"))
+# Calculate Mean Intensity for all groups (needed for Log2FC)
+group_means <- data_imputed %>%
+  rowwise() %>%
+  mutate(
+    Mean_C = mean(c_across(all_of(data_cols[substr(data_cols, 1, 1) == "C"]))),
+    Mean_D = mean(c_across(all_of(data_cols[substr(data_cols, 1, 1) == "D"]))),
+    Mean_L = mean(c_across(all_of(data_cols[substr(data_cols, 1, 1) == "L"]))),
+    Mean_E = mean(c_across(all_of(data_cols[substr(data_cols, 1, 1) == "E"])))
+  ) %>%
+  ungroup() %>%
+  select(ProteinID, Gene, starts_with("Mean_"))
+
+
+# Function to run pairwise T-test and generate volcano plot
+generate_volcano <- function(g1, g2, data, group_means, data_cols) {
+  
+  comparison_name <- paste0(g2, " vs ", g1) # g2 is numerator, g1 is denominator
+  
+  # Calculate Log2FC
+  fc_col_name <- paste0("Log2FC_", g2, "_vs_", g1)
+  
+  # Select the mean columns dynamically and calculate Log2FC
+  fc_data <- group_means %>%
+    mutate(!!fc_col_name := .data[[paste0("Mean_", g2)]] - .data[[paste0("Mean_", g1)]]) %>%
+    select(ProteinID, Gene, !!fc_col_name)
+  
+  # Run T-tests for p-value (STATISTICALLY CORRECT APPROACH FOR PAIRWISE)
+  cols_g1 <- data_cols[substr(data_cols, 1, 1) == g1]
+  cols_g2 <- data_cols[substr(data_cols, 1, 1) == g2]
+  
+  pairwise_long_data <- data %>%
+    select(ProteinID, Gene, all_of(c(cols_g1, cols_g2))) %>%
+    pivot_longer(cols = all_of(c(cols_g1, cols_g2)), names_to = "Sample", values_to = "Intensity") %>%
+    mutate(Group = substr(Sample, 1, 1))
+  
+  t_test_results <- pairwise_long_data %>%
+    group_by(ProteinID, Gene) %>%
+    summarise(
+      p_val = tryCatch({
+        # Two-sample T-test
+        t.test(Intensity ~ Group, data = cur_data())$p.value
+      }, error = function(e) {
+        return(1) # Return 1 if t-test fails
+      }),
+      .groups = "drop"
+    )
+  
+  # Combine results and adjust p-values
+  final_df <- left_join(t_test_results, fc_data, by = c("ProteinID", "Gene"))
+  final_df$p_adj <- p.adjust(final_df$p_val, method = "BH")
+  
+  log2fc_col <- sym(fc_col_name)
+  
+  # Define significance (FDR < 0.05 AND |Log2FC| > 1)
+  final_df <- final_df %>%
+    mutate(IsSig = case_when(
+      p_adj < 0.05 & abs(!!log2fc_col) > 1 ~ "Significant",
+      p_adj < 0.05 & abs(!!log2fc_col) <= 1 ~ "p < 0.05",
+      TRUE ~ "Not Sig"
+    ))
+  
+  # Generate Plot (Using T-test results)
+  plot_title <- paste0("Volcano Plot: ", comparison_name, " (Top 3 Samples)")
+  
+  plot_out <- ggplot(final_df, aes(x = !!log2fc_col, y = -log10(p_adj), color = IsSig)) +
+    geom_point(alpha = 0.6) +
+    geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+    geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+    scale_color_manual(values = c("p < 0.05" = "blue", "Significant" = "red", "Not Sig" = "grey")) +
+    geom_text_repel(data = subset(final_df, IsSig %in% c("Significant", "p < 0.05")), 
+                    aes(label = Gene), max.overlaps = 20, size = 3,
+                    order = -log10(final_df$p_adj)) +
+    theme_minimal() +
+    labs(title = plot_title, 
+         x = paste0("Log2 Fold Change (", g2, " - ", g1, ")"), 
+         y = "-Log10 FDR",
+         color = "Significance")
+  
+  print(plot_out)
+  
+  return(final_df)
+}
+
+# Main Plotting Loop
+all_groups <- unique(substr(data_cols, 1, 1))
+group_combinations <- combn(all_groups, 2) 
+
+all_results_list <- list()
+
+for(i in 1:ncol(group_combinations)) {
+  # g1 is the denominator (baseline), g2 is the numerator (comparison)
+  g1 <- group_combinations[1, i] 
+  g2 <- group_combinations[2, i] 
+  
+  # Generate Volcano Plot and get results
+  results_df <- generate_volcano(g1, g2, data_imputed, group_means, data_cols)
+  
+  # Store results
+  results_df$Comparison <- paste0(g2, "_vs_", g1)
+  all_results_list[[i]] <- results_df
+}
+
+# Combine all results into one large data frame and save
+all_final_results <- bind_rows(all_results_list)
 
 # ---------------------------------------------------------------------
-write.csv(final_results, "results.csv", row.names = FALSE)
+# Saving all results
+write.csv(all_final_results, "all_pairwise_results.csv", row.names = FALSE)
